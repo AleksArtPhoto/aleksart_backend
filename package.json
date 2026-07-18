@@ -1,13 +1,14 @@
 {
   "name": "aleks-art-photo-booking-server",
-  "version": "1.0.0",
-  "description": "Backend for the Aleks Art Photo booking page: Stripe payments, slot blocking, email notifications.",
+  "version": "2.0.0",
+  "description": "Backend for the Aleks Art Photo booking page: Stripe payments, B2B invoicing, slot blocking, email notifications, admin panel API.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
