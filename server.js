@@ -1,117 +1,252 @@
+require('dotenv').config();
+
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
-require('dotenv').config();
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const Stripe = require('stripe');
+
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const PORT = process.env.PORT || 3000;
+const BLOCK_HOURS_AFTER_BOOKING = parseInt(process.env.BLOCK_HOURS_AFTER_BOOKING || '2', 10);
+const WORK_START_HOUR = 9;
+const WORK_END_HOUR = 20;
+
+const BOOKINGS_FILE = path.join(__dirname, 'bookings.json');
 
 const app = express();
 
-// Разрешаем вашему сайту на GitHub Pages общаться с сервером
 app.use(cors({
-  origin: 'https://github.io'
+  origin: (process.env.ALLOWED_ORIGIN || '*').split(',').map(s => s.trim()),
 }));
+
+// ===== Stripe webhook needs the RAW body, so it must be registered
+// BEFORE the json() body parser below =====
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers['stripe-signature'],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'payment_intent.succeeded') {
+    try {
+      await finalizeBookingFromIntent(event.data.object);
+    } catch (err) {
+      console.error('Error finalizing booking from webhook:', err);
+    }
+  }
+
+  res.json({ received: true });
+});
+
 app.use(express.json());
 
-// База данных цен на сервере (для сверки)
-const servicesPriceList = {
-  "mini": 2500, "standard": 4500, "signature": 6500, "private": 5500,
-  "wedding": 12500, "fullday": 22000, "reels": 3500, "cinematic": 6000,
-  "family": 8500, "filmlook": 3500, "proedit": 1500, "fineart": 450,
-  "restoration": 600, "workshop": 2500, "review": 1200,
-  "ecom_mini": 3000, "comm_signature": 6500, "premium_exp": 9500,
-  "prod_basic": 2800, "prod_brand": 5500, "prod_camp": 9500,
-  "interior_ess": 3500, "interior_std": 5500, "interior_prem": 8500,
-  "social_clip": 3500, "social_plus": 5500, "brand_intro": 7500,
-  "biz_promo": 9500, "comm_pkg": 15000, "property_vid": 4500,
-  "logo_anim": 1500, "motion_basic": 1800, "motion_ctx": 2500, "motion_upgrade": 3500
-};
-
-// 1. НАСТРОЙКА РОБОТА ОТПРАВКИ ПИСЕМ (GMAIL SMTP)
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,       // Ваш Gmail адрес
-    pass: process.env.EMAIL_APP_PASS   // Тот самый 16-значный пароль приложения
-  }
-});
-
-// Эндпоинт инициализации платежа Stripe
-app.post('/api/create-payment-intent', async (req, res) => {
-  const { name, email, phone, location, comment, serviceId, serviceName, isGiftCertificate, date, startTime } = req.body;
-
-  const price = servicesPriceList[serviceId];
-  if (!price) {
-    return res.status(400).json({ error: "Invalid service type" });
-  }
-
+// ===== Storage helpers (simple JSON file — fine for a single-photographer calendar) =====
+function loadBookings() {
+  if (!fs.existsSync(BOOKINGS_FILE)) return [];
   try {
-    // 2. СОЗДАНИЕ СЕССИИ ПЛАТЕЖА В STRIPE
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: price * 100, // Конвертируем DKK в гроши (2500 DKK = 250000)
-      currency: 'dkk',
-      automatic_payment_methods: { enabled: true },
-      metadata: {
-        name, email, phone, location, date, startTime,
-        serviceId, isGiftCertificate: String(isGiftCertificate), comment
-      }
-    });
-
-    // 3. ОТПРАВКА СЕКРЕТНОГО ТОКЕНА КЛИЕНТУ НА ФРОНТЕНД
-    res.json({ clientSecret: paymentIntent.client_secret });
-
-    // 4. АВТОМАТИЧЕСКАЯ ОТПРАВКА КРАСИВОГО ПИСЬМА-ПОДТВЕРЖДЕНИЯ
-    sendBookingEmail(email, {
-      name, phone, location, comment, date, startTime, price, serviceName, isGiftCertificate
-    });
-
-  } catch (error) {
-    console.error("Stripe error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ФУНКЦИЯ СБОРКИ И ОТПРАВКИ HTML-ПИСЬМА
-async function sendBookingEmail(clientEmail, data) {
-  const giftStatus = data.isGiftCertificate ? "🎁 YES (Gift Certificate)" : "❌ No (Standard Session)";
-  
-  const htmlContent = `
-    <div style="font-family: 'Josefin Sans', sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #f1f5f9; border-radius: 8px;">
-      <h2 style="color: #1e293b; text-align: center; border-bottom: 2px solid #f1f5f9; padding-bottom: 15px;">📸 Photoshoot Booking Details</h2>
-      <p>Hello! A new photo session registration has been initialized.</p>
-      
-      <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-        <tr style="background-color: #f8fafc;"><td style="padding: 10px; font-weight: bold;">Client Name:</td><td style="padding: 10px;">${data.name}</td></tr>
-        <tr><td style="padding: 10px; font-weight: bold;">Email:</td><td style="padding: 10px;">${data.email || clientEmail}</td></tr>
-        <tr style="background-color: #f8fafc;"><td style="padding: 10px; font-weight: bold;">Phone:</td><td style="padding: 10px;">${data.phone}</td></tr>
-        <tr><td style="padding: 10px; font-weight: bold;">Service:</td><td style="padding: 10px; font-weight: #600;">${data.serviceName || data.serviceId}</td></tr>
-        <tr style="background-color: #f8fafc;"><td style="padding: 10px; font-weight: bold;">Date:</td><td style="padding: 10px; color: #1e3a8a;"><b>${data.date}</b></td></tr>
-        <tr><td style="padding: 10px; font-weight: bold;">Start Time:</td><td style="padding: 10px;">Starts at ${data.startTime}</td></tr>
-        <tr style="background-color: #f8fafc;"><td style="padding: 10px; font-weight: bold;">Location:</td><td style="padding: 10px;">${data.location}</td></tr>
-        <tr><td style="padding: 10px; font-weight: bold;">Gift Certificate:</td><td style="padding: 10px;">${giftStatus}</td></tr>
-        <tr style="background-color: #f8fafc;"><td style="padding: 10px; font-weight: bold;">Price:</td><td style="padding: 10px; font-size: 18px; color: #0f172a; font-weight: bold;">${data.price} DKK</td></tr>
-      </table>
-      
-      <div style="background-color: #f8fafc; padding: 15px; border-radius: 6px; margin-top: 15px;">
-        <h4 style="margin: 0 0 5px 0; color: #475569;">Client's Comment:</h4>
-        <p style="margin: 0; font-style: italic; color: #334155;">"${data.comment || 'No comments left.'}"</p>
-      </div>
-      
-      <p style="font-size: 12px; color: #94a3b8; text-align: center; margin-top: 30px;">Automated system by Aleks Art Photo. Payment processing secured via Stripe.</p>
-    </div>
-  `;
-
-  try {
-    await transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to: [process.env.EMAIL_USER, clientEmail], // Отправка копии и вам на почту, и клиенту
-      subject: `📸 Photoshoot Booking Confirmed — ${data.date}`,
-      html: htmlContent
-    });
-    console.log("Emails sent successfully to manager and client.");
-  } catch (err) {
-    console.error("Email delivery failed:", err);
+    return JSON.parse(fs.readFileSync(BOOKINGS_FILE, 'utf8'));
+  } catch {
+    return [];
   }
 }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+function saveBookings(bookings) {
+  fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(bookings, null, 2));
+}
+
+// Hourly slots a booking occupies: the booked hour itself, plus the
+// configured number of hours after it (buffer to travel to the next job).
+function blockedSlotsForStart(hour) {
+  const slots = [];
+  for (let h = hour; h <= Math.min(hour + BLOCK_HOURS_AFTER_BOOKING, WORK_END_HOUR); h++) {
+    slots.push(`${h.toString().padStart(2, '0')}:00`);
+  }
+  return slots;
+}
+
+function isSlotFree(bookings, date, time) {
+  const hour = parseInt(time.split(':')[0], 10);
+  return !bookings.some(b => {
+    if (b.date !== date) return false;
+    return b.blockedTimes.includes(`${hour.toString().padStart(2, '0')}:00`);
+  });
+}
+
+// ===== Mail =====
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: parseInt(process.env.SMTP_PORT || '587', 10),
+  secure: process.env.SMTP_PORT === '465',
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
+
+async function sendBookingEmails(booking) {
+  const summary = `
+Service: ${booking.serviceName}${booking.isGift ? ' (Gift Certificate)' : ''}
+Date: ${booking.date}
+Time: ${booking.time}
+Price: ${booking.price} DKK
+Location: ${booking.customer.location}
+${booking.customer.comment ? `Comment: ${booking.customer.comment}` : ''}
+`.trim();
+
+  // Confirmation to the client
+  await transporter.sendMail({
+    from: process.env.MAIL_FROM,
+    to: booking.customer.email,
+    subject: 'Your booking is confirmed — Aleks Art Photo',
+    text: `Hi ${booking.customer.name},\n\nYour payment went through and your session is booked.\n\n${summary}\n\nSee you then!\nAleks Art Photo`,
+  });
+
+  // Copy to the owner for record-keeping
+  await transporter.sendMail({
+    from: process.env.MAIL_FROM,
+    to: process.env.OWNER_EMAIL,
+    subject: `New paid booking: ${booking.customer.name} — ${booking.date} ${booking.time}`,
+    text: `New confirmed booking:\n\n${summary}\n\nClient: ${booking.customer.name}\nEmail: ${booking.customer.email}\nPhone: ${booking.customer.phone}\n\nPayment Intent: ${booking.paymentIntentId}`,
+  });
+}
+
+// ===== Idempotent finalize: called from both the webhook and the
+// client's "finalize" call right after confirmCardPayment resolves =====
+async function finalizeBookingFromIntent(paymentIntentObjOrId) {
+  const paymentIntent = typeof paymentIntentObjOrId === 'string'
+    ? await stripe.paymentIntents.retrieve(paymentIntentObjOrId)
+    : paymentIntentObjOrId;
+
+  if (paymentIntent.status !== 'succeeded') {
+    throw new Error('Payment not completed yet.');
+  }
+
+  const bookings = loadBookings();
+
+  // already recorded (webhook + client call can both fire) — skip duplicate
+  if (bookings.some(b => b.paymentIntentId === paymentIntent.id)) {
+    return bookings.find(b => b.paymentIntentId === paymentIntent.id);
+  }
+
+  const meta = paymentIntent.metadata;
+  const hour = parseInt(meta.time.split(':')[0], 10);
+
+  const booking = {
+    id: paymentIntent.id,
+    paymentIntentId: paymentIntent.id,
+    date: meta.date,
+    time: meta.time,
+    blockedTimes: blockedSlotsForStart(hour),
+    category: meta.category,
+    serviceId: meta.serviceId,
+    serviceName: meta.serviceName,
+    price: parseInt(meta.price, 10),
+    isGift: meta.isGift === 'true',
+    customer: {
+      name: meta.customerName,
+      email: meta.customerEmail,
+      phone: meta.customerPhone,
+      location: meta.customerLocation,
+      comment: meta.customerComment || '',
+    },
+    createdAt: new Date().toISOString(),
+  };
+
+  bookings.push(booking);
+  saveBookings(bookings);
+
+  await sendBookingEmails(booking);
+
+  return booking;
+}
+
+// ===== Routes =====
+
+// Which hourly slots are already taken for a given date
+app.get('/api/availability', (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ message: 'Missing date' });
+
+  const bookings = loadBookings();
+  const blocked = new Set();
+  bookings.filter(b => b.date === date).forEach(b => {
+    b.blockedTimes.forEach(t => blocked.add(t));
+  });
+
+  res.json({ blocked: Array.from(blocked) });
+});
+
+// Create a PaymentIntent for the chosen service/date/time, after
+// re-checking the slot is still free (protects against double-booking
+// when two people are looking at the same slot at once)
+app.post('/api/create-payment-intent', async (req, res) => {
+  try {
+    const { category, serviceId, serviceName, price, isGift, date, time, customer } = req.body;
+
+    if (!category || !serviceId || !serviceName || !price || !date || !time || !customer) {
+      return res.status(400).json({ message: 'Missing booking details.' });
+    }
+    if (!customer.name || !customer.email || !customer.phone || !customer.location) {
+      return res.status(400).json({ message: 'Missing contact details.' });
+    }
+
+    const bookings = loadBookings();
+    if (!isSlotFree(bookings, date, time)) {
+      return res.status(409).json({ message: 'This time slot was just booked by someone else. Please choose another.' });
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(price * 100), // DKK -> øre
+      currency: 'dkk',
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        category,
+        serviceId,
+        serviceName,
+        price: String(price),
+        isGift: String(!!isGift),
+        date,
+        time,
+        customerName: customer.name,
+        customerEmail: customer.email,
+        customerPhone: customer.phone,
+        customerLocation: customer.location,
+        customerComment: (customer.comment || '').slice(0, 400),
+      },
+    });
+
+    res.json({ clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Could not start payment. Please try again.' });
+  }
+});
+
+// Called by the frontend right after stripe.confirmCardPayment succeeds.
+// Also mirrored by the webhook above so a booking still gets recorded
+// and emailed even if the client's tab closes right after paying.
+app.post('/api/finalize-booking', async (req, res) => {
+  try {
+    const { paymentIntentId } = req.body;
+    if (!paymentIntentId) return res.status(400).json({ message: 'Missing paymentIntentId' });
+
+    const booking = await finalizeBookingFromIntent(paymentIntentId);
+    res.json({ ok: true, booking });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Booking backend running on port ${PORT}`);
+});
