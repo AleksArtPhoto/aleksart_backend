@@ -1,403 +1,654 @@
-require('dotenv').config();
+// ===== CONFIG =====
+const API_BASE = window.BOOKING_API_BASE || '';
+const stripe = Stripe(window.STRIPE_PUBLIC_KEY);
+const $ = (id) => document.getElementById(id);
 
-const crypto = require('crypto');
-const express = require('express');
-const cors = require('cors');
-const cookieParser = require('cookie-parser');
-const Stripe = require('stripe');
+let SERVICES = { individual: [], business: [], depositPercent: 30, workStartHour: 9, workEndHour: 20 };
 
-const cfg = require('./services-config');
-const store = require('./bookings-store');
-const mail = require('./mail');
-const adminAuth = require('./admin-auth');
+const state = {
+  individual: { serviceId: '', service: null, date: null, time: null, blockedTimes: [], price: 0 },
+  business: { serviceId: '', service: null, date: null, time: null, blockedTimes: [], price: 0 },
+};
 
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-const PORT = process.env.PORT || 3000;
+let currentPaymentIntentId = null;
 
-const app = express();
-
-const allowedOrigins = (process.env.ALLOWED_ORIGIN || '*').split(',').map(s => s.trim());
-app.use(cors({
-  origin: allowedOrigins.includes('*') ? true : allowedOrigins,
-  credentials: true,
-}));
-
-// ===== Stripe webhook needs the RAW body — must be registered BEFORE express.json() =====
-app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      req.headers['stripe-signature'],
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    console.error('Webhook signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  if (event.type === 'payment_intent.succeeded') {
-    try {
-      await finalizeIndividualBooking(event.data.object);
-    } catch (err) {
-      console.error('Error finalizing booking from webhook:', err);
-    }
-  }
-
-  res.json({ received: true });
-});
-
-app.use(express.json());
-app.use(cookieParser());
-
-// ============================================================
-// PUBLIC: services config (single source of truth for the frontend)
-// ============================================================
-app.get('/api/services', (req, res) => {
-  res.json({
-    individual: cfg.INDIVIDUAL_SERVICES,
-    business: cfg.BUSINESS_SERVICES,
-    depositPercent: cfg.BUSINESS_DEPOSIT_PERCENT,
-    workStartHour: cfg.WORK_START_HOUR,
-    workEndHour: cfg.WORK_END_HOUR,
-    materialsEmail: cfg.MATERIALS_EMAIL,
-  });
-});
-
-// ============================================================
-// PUBLIC: availability for a date (used by both B2C and B2B tabs)
-// ============================================================
-app.get('/api/availability', (req, res) => {
-  const { date } = req.query;
-  if (!date) return res.status(400).json({ message: 'Missing date' });
-  const map = store.getBlockedSlotsForDate(date);
-  res.json({ blocked: Object.keys(map) });
-});
-
-// ============================================================
-// INDIVIDUAL (B2C) — Stripe PaymentIntent
-// ============================================================
-app.post('/api/create-payment-intent', async (req, res) => {
-  try {
-    const { serviceId, date, time, customer, extra } = req.body;
-    const service = cfg.findService('individual', serviceId);
-    if (!service) return res.status(400).json({ message: 'Unknown service.' });
-    if (!customer || !customer.name || !customer.email || !customer.phone) {
-      return res.status(400).json({ message: 'Missing contact details.' });
-    }
-
-    let price = service.price;
-    let quantity = null;
-    let giftForServiceId = null;
-    let giftForServiceName = null;
-    let recipientName = null;
-
-    if (service.specialFlow === 'giftcert') {
-      const target = cfg.findService('individual', extra && extra.giftForServiceId);
-      if (!target || target.price == null) {
-        return res.status(400).json({ message: 'Please choose a valid service for the gift certificate.' });
-      }
-      if (!extra || !extra.recipientName) {
-        return res.status(400).json({ message: 'Please enter the recipient\'s full name.' });
-      }
-      price = target.price;
-      giftForServiceId = target.id;
-      giftForServiceName = target.name;
-      recipientName = extra.recipientName;
-    } else if (service.perUnit) {
-      quantity = parseInt(extra && extra.photoCount, 10);
-      if (!quantity || quantity < 1) {
-        return res.status(400).json({ message: 'Please enter a valid number of photos.' });
-      }
-      price = service.price * quantity;
-    }
-
-    const needsCalendar = service.blockAfterHours !== null;
-    let blockedTimes = [];
-
-    if (needsCalendar) {
-      if (!date || !time) return res.status(400).json({ message: 'Please select a date and time.' });
-      const hour = parseInt(time.split(':')[0], 10);
-      blockedTimes = cfg.computeBlockedSlots(hour, service.blockAfterHours);
-      const anyTaken = blockedTimes.some(t => !store.isSlotFree(date, t));
-      if (anyTaken) {
-        return res.status(409).json({ message: 'This time slot is no longer fully available. Please choose another.' });
-      }
-    }
-
-    if (service.locationField !== 'none' && !customer.location) {
-      return res.status(400).json({ message: service.locationField === 'googlemeet' ? 'Please enter your Google Meet contact.' : 'Please enter the shoot location.' });
-    }
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(price * 100),
-      currency: 'dkk',
-      automatic_payment_methods: { enabled: true },
-      metadata: {
-        category: 'individual',
-        serviceId: service.id,
-        serviceName: service.name,
-        price: String(price),
-        quantity: quantity ? String(quantity) : '',
-        specialFlow: service.specialFlow || '',
-        giftForServiceId: giftForServiceId || '',
-        giftForServiceName: giftForServiceName || '',
-        recipientName: recipientName || '',
-        date: needsCalendar ? date : '',
-        time: needsCalendar ? time : '',
-        blockedTimes: JSON.stringify(blockedTimes),
-        locationFieldType: service.locationField,
-        customerName: customer.name,
-        customerEmail: customer.email,
-        customerPhone: customer.phone,
-        customerLocation: customer.location || '',
-        customerComment: (customer.comment || '').slice(0, 400),
-      },
-    });
-
-    res.json({ clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Could not start payment. Please try again.' });
-  }
-});
-
-async function finalizeIndividualBooking(paymentIntentObjOrId) {
-  const paymentIntent = typeof paymentIntentObjOrId === 'string'
-    ? await stripe.paymentIntents.retrieve(paymentIntentObjOrId)
-    : paymentIntentObjOrId;
-
-  if (paymentIntent.status !== 'succeeded') throw new Error('Payment not completed yet.');
-
-  const existing = store.loadBookings().find(b => b.paymentIntentId === paymentIntent.id);
-  if (existing) return existing;
-
-  const m = paymentIntent.metadata;
-  const blockedTimes = m.blockedTimes ? JSON.parse(m.blockedTimes) : [];
-
-  const booking = {
-    id: paymentIntent.id,
-    paymentIntentId: paymentIntent.id,
-    source: 'stripe',
-    status: 'confirmed',
-    category: 'individual',
-    serviceId: m.serviceId,
-    serviceName: m.serviceName,
-    price: parseInt(m.price, 10),
-    quantity: m.quantity ? parseInt(m.quantity, 10) : null,
-    specialFlow: m.specialFlow || null,
-    giftForServiceName: m.giftForServiceName || null,
-    recipientName: m.recipientName || null,
-    date: m.date || null,
-    time: m.time || null,
-    blockedTimes,
-    locationFieldType: m.locationFieldType,
-    customer: {
-      name: m.customerName,
-      email: m.customerEmail,
-      phone: m.customerPhone,
-      location: m.customerLocation,
-      comment: m.customerComment,
-    },
-    createdAt: new Date().toISOString(),
-  };
-
-  store.addBooking(booking);
-  await mail.sendIndividualBookingEmails(booking);
-  return booking;
+function formatNumber(n) {
+  return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
 }
 
-app.post('/api/finalize-booking', async (req, res) => {
+// ============================================================
+// PAGE INIT — the toggle, calendars and buttons must all work
+// even if the backend is unreachable, so wiring them up does NOT
+// wait on the /api/services fetch. Only the service dropdowns
+// (which need real data) depend on that fetch succeeding.
+// ============================================================
+function initStaticUI() {
+  setupToggle();
+  setupIndividualPanel();
+  setupBusinessPanel();
+  setupPolicyToggle();
+}
+
+async function loadServices() {
   try {
-    const { paymentIntentId } = req.body;
-    if (!paymentIntentId) return res.status(400).json({ message: 'Missing paymentIntentId' });
-    const booking = await finalizeIndividualBooking(paymentIntentId);
-    res.json({ ok: true, booking });
+    const res = await fetch(`${API_BASE}/api/services`);
+    if (!res.ok) throw new Error('Bad response');
+    SERVICES = await res.json();
+    populateSelect($('individual-select'), SERVICES.individual);
+    populateSelect($('business-select'), SERVICES.business);
   } catch (err) {
-    console.error(err);
-    res.status(400).json({ message: err.message });
+    console.error('Could not load services config', err);
+    const err1 = $('individual-form-error');
+    if (err1) {
+      err1.textContent = 'Could not load the services list from the server. The toggle and calendar still work, but please check BOOKING_API_BASE in booking.html and that the backend is running.';
+      err1.classList.remove('hidden');
+    }
   }
-});
+}
+
+function populateSelect(selectEl, services) {
+  services.forEach((s) => {
+    const opt = document.createElement('option');
+    opt.value = s.id;
+    opt.textContent = s.price != null ? `${s.name} — ${formatNumber(s.price)} DKK` : s.name;
+    selectEl.appendChild(opt);
+  });
+}
 
 // ============================================================
-// BUSINESS (B2B) — no Stripe, 48h held slot + deposit invoice by email
+// BRAND TOGGLE (visual behaviour copied 1:1 from the homepage toggle)
 // ============================================================
-app.post('/api/business-booking', async (req, res) => {
+function setupToggle() {
+  const toggleContainer = $('toggle-container');
+  const toggleBg = $('toggle-bg');
+  const textB2C = $('text-b2c');
+  const textB2B = $('text-b2b');
+  const b2cContent = $('b2c-content');
+  const b2bContent = $('b2b-content');
+
+  if (!toggleContainer || !b2cContent || !b2bContent) return;
+
+  let isBusinessMode = false;
+
+  toggleBg.style.left = '4px';
+  toggleBg.style.background = '#e2e8f0';
+  textB2C.style.color = '#1e293b';
+  textB2B.style.color = '#94a3b8';
+
+  toggleContainer.addEventListener('click', () => {
+    isBusinessMode = !isBusinessMode;
+
+    if (isBusinessMode) {
+      toggleBg.style.left = 'calc(100% - 142px)';
+      toggleBg.style.background = '#2c3e50';
+      textB2B.style.color = '#ffffff';
+      textB2C.style.color = '#94a3b8';
+
+      b2cContent.classList.add('hidden');
+      b2bContent.classList.remove('hidden');
+    } else {
+      toggleBg.style.left = '4px';
+      toggleBg.style.background = '#d8e0e9';
+      textB2C.style.color = '#1e293b';
+      textB2B.style.color = '#94a3b8';
+
+      b2bContent.classList.add('hidden');
+      b2cContent.classList.remove('hidden');
+    }
+  });
+}
+
+// ============================================================
+// SHARED: date/time picker helpers (used for both b2c and b2b,
+// each with its own prefix so they don't interfere)
+// ============================================================
+function setupCalendar(prefix, category) {
+  new Litepicker({
+    element: $(`${prefix}-datepicker`),
+    format: 'YYYY-MM-DD',
+    minDate: new Date(),
+    setup: (picker) => {
+      picker.on('selected', () => {
+        state[category].date = $(`${prefix}-datepicker`).value;
+        state[category].time = null;
+        const warn = $(`${prefix}-date-warning`);
+        if (warn) warn.classList.add('hidden');
+        loadAvailabilityAndRenderSlots(prefix, category);
+      });
+    },
+  });
+}
+
+async function loadAvailabilityAndRenderSlots(prefix, category) {
+  const loading = $(`${prefix}-slots-loading`);
+  const date = state[category].date;
+  state[category].blockedTimes = [];
+
+  if (!date) {
+    renderTimeSlots(prefix, category);
+    return;
+  }
+
+  if (loading) loading.classList.remove('hidden');
+
   try {
-    const { serviceId, date, time, customer } = req.body;
-    const service = cfg.findService('business', serviceId);
-    if (!service) return res.status(400).json({ message: 'Unknown service.' });
-
-    if (!customer || !customer.companyName || !customer.cvr || !customer.legalAddress || !customer.invoiceEmail || !customer.contactName) {
-      return res.status(400).json({ message: 'Please fill in all required company details.' });
+    const res = await fetch(`${API_BASE}/api/availability?date=${encodeURIComponent(date)}`);
+    if (res.ok) {
+      const data = await res.json();
+      state[category].blockedTimes = data.blocked || [];
     }
-    if (service.locationField !== 'none' && !customer.location) {
-      return res.status(400).json({ message: 'Please enter the shoot location.' });
-    }
+  } catch (err) {
+    console.error('Could not load availability', err);
+  } finally {
+    if (loading) loading.classList.add('hidden');
+    renderTimeSlots(prefix, category);
+  }
+}
 
-    const needsCalendar = service.blockAfterHours !== null;
-    let blockedTimes = [];
+function formatDate(d) {
+  const y = d.getFullYear();
+  const m = (d.getMonth() + 1).toString().padStart(2, '0');
+  const day = d.getDate().toString().padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
 
-    if (needsCalendar) {
-      if (!date || !time) return res.status(400).json({ message: 'Please select a date and time.' });
-      const hour = parseInt(time.split(':')[0], 10);
-      blockedTimes = cfg.computeBlockedSlots(hour, service.blockAfterHours);
-      const anyTaken = blockedTimes.some(t => !store.isSlotFree(date, t));
-      if (anyTaken) {
-        return res.status(409).json({ message: 'This time slot is no longer fully available. Please choose another.' });
-      }
-    }
+function renderTimeSlots(prefix, category) {
+  const container = $(`${prefix}-time-slots`);
+  const display = $(`${prefix}-selected-time-display`);
+  if (!container) return;
 
-    const booking = {
-      id: crypto.randomUUID(),
-      source: 'business',
-      status: 'pending_business',
-      category: 'business',
-      serviceId: service.id,
-      serviceName: service.name,
-      price: service.price,
-      blockAfterHoursRule: service.blockAfterHours,
-      date: needsCalendar ? date : null,
-      time: needsCalendar ? time : null,
-      blockedTimes,
-      locationFieldType: service.locationField,
-      customer: {
-        companyName: customer.companyName,
-        cvr: customer.cvr,
-        legalAddress: customer.legalAddress,
-        invoiceEmail: customer.invoiceEmail,
-        contactName: customer.contactName,
-        location: customer.location || '',
-      },
-      createdAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + cfg.BUSINESS_HOLD_HOURS * 60 * 60 * 1000).toISOString(),
+  container.innerHTML = '';
+  const date = state[category].date;
+  if (!date) return;
+
+  const now = new Date();
+  const isToday = date === formatDate(now);
+  const { workStartHour, workEndHour } = SERVICES;
+
+  for (let h = workStartHour; h <= workEndHour; h++) {
+    const time = `${h.toString().padStart(2, '0')}:00`;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'slot-btn';
+    btn.textContent = time;
+
+    const isPast = isToday && h <= now.getHours();
+    const isBlocked = state[category].blockedTimes.includes(time);
+
+    if (isPast || isBlocked) btn.disabled = true;
+    if (state[category].time === time) btn.classList.add('slot-btn-selected');
+
+    btn.onclick = () => {
+      state[category].time = time;
+      if (display) display.textContent = `Selected: ${time}`;
+      renderTimeSlots(prefix, category);
+      if (category === 'individual') updateIndividualPayButtonState();
+      else updateBusinessButtonState();
     };
 
-    store.addBooking(booking);
-    await mail.sendBusinessBookingEmails(booking);
-
-    res.json({ ok: true, bookingId: booking.id });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Could not submit the booking request. Please try again.' });
+    container.appendChild(btn);
   }
-});
+}
+
+function toggleCalendarBlock(prefix, service) {
+  const block = $(`${prefix === 'ind' ? 'individual' : 'business'}-calendar-block`);
+  if (!block) return;
+  const needsCalendar = service && service.blockAfterHours !== null;
+  block.classList.toggle('hidden', !needsCalendar);
+}
 
 // ============================================================
-// ADMIN
+// INDIVIDUAL (B2C) PANEL
 // ============================================================
-app.post('/api/admin/login', (req, res) => {
-  const { username, password } = req.body || {};
-  const token = adminAuth.login(username, password);
-  if (!token) return res.status(401).json({ message: 'Invalid credentials.' });
+function setupIndividualPanel() {
+  setupCalendar('ind', 'individual');
 
-  res.cookie('admin_token', token, {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'none',
-    maxAge: 12 * 60 * 60 * 1000,
+  const select = $('individual-select');
+  select.addEventListener('change', () => {
+    const service = SERVICES.individual.find((s) => s.id === select.value) || null;
+    state.individual.serviceId = select.value;
+    state.individual.service = service;
+    state.individual.date = null;
+    state.individual.time = null;
+    $('ind-datepicker').value = '';
+    $('ind-selected-time-display').textContent = '';
+
+    toggleCalendarBlock('ind', service);
+    renderIndividualLocationField(service);
+    renderIndividualExtraFields(service);
+    recomputeIndividualPrice();
+    updateIndividualPayButtonState();
   });
-  res.json({ ok: true });
-});
 
-app.post('/api/admin/logout', (req, res) => {
-  adminAuth.logout(req.cookies ? req.cookies.admin_token : null);
-  res.clearCookie('admin_token');
-  res.json({ ok: true });
-});
+  const giftCheckbox = $('gift-certificate');
+  if (giftCheckbox) giftCheckbox.addEventListener('change', updateIndividualPayButtonState);
 
-app.get('/api/admin/check', adminAuth.requireAdmin, (req, res) => res.json({ ok: true }));
+  const payBtn = $('individual-pay-button');
+  payBtn.addEventListener('click', onIndividualPayClick);
+}
 
-// Full day view for the admin calendar: per-hour status + full booking list
-app.get('/api/admin/day', adminAuth.requireAdmin, (req, res) => {
-  const { date } = req.query;
-  if (!date) return res.status(400).json({ message: 'Missing date' });
+function renderIndividualLocationField(service) {
+  const group = $('individual-location-group');
+  const label = $('individual-location-label');
+  const input = group.querySelector('input[name="location"]');
 
-  const slots = store.getBlockedSlotsForDate(date);
-  const bookings = store.getBookingsForDate(date).filter(b => b.status !== 'cancelled' && b.status !== 'expired');
-
-  res.json({ slots, bookings });
-});
-
-app.get('/api/admin/bookings/:id', adminAuth.requireAdmin, (req, res) => {
-  const booking = store.getBooking(req.params.id);
-  if (!booking) return res.status(404).json({ message: 'Not found' });
-  res.json(booking);
-});
-
-app.put('/api/admin/bookings/:id', adminAuth.requireAdmin, (req, res) => {
-  const existing = store.getBooking(req.params.id);
-  if (!existing) return res.status(404).json({ message: 'Not found' });
-
-  const patch = { ...req.body };
-
-  // If date/time changed, recompute the blocked buffer using the rule
-  // stored at creation time (falls back to no recompute if unknown).
-  if ((patch.date && patch.date !== existing.date) || (patch.time && patch.time !== existing.time)) {
-    const rule = existing.blockAfterHoursRule !== undefined ? existing.blockAfterHoursRule
-      : (cfg.findService(existing.category, existing.serviceId) || {}).blockAfterHours;
-    const hour = parseInt((patch.time || existing.time).split(':')[0], 10);
-    patch.blockedTimes = cfg.computeBlockedSlots(hour, rule);
+  if (!service || service.locationField === 'none') {
+    group.classList.add('hidden');
+    input.required = false;
+    return;
   }
 
-  const updated = store.updateBooking(req.params.id, patch);
-  res.json({ ok: true, booking: updated });
-});
+  group.classList.remove('hidden');
+  input.required = true;
 
-app.delete('/api/admin/bookings/:id', adminAuth.requireAdmin, (req, res) => {
-  const cancelled = store.cancelBooking(req.params.id);
-  if (!cancelled) return res.status(404).json({ message: 'Not found' });
-  res.json({ ok: true });
-});
+  if (service.locationField === 'googlemeet') {
+    label.textContent = 'Google Meet Email / Contact for the Call *';
+    input.placeholder = 'e.g. your Google account email';
+  } else {
+    label.textContent = 'Location / Address of the Shoot *';
+    input.placeholder = '';
+  }
+}
 
-app.post('/api/admin/bookings/:id/resend', adminAuth.requireAdmin, async (req, res) => {
-  const booking = store.getBooking(req.params.id);
-  if (!booking) return res.status(404).json({ message: 'Not found' });
+function renderIndividualExtraFields(service) {
+  const container = $('individual-extra-fields');
+  container.innerHTML = '';
+
+  if (!service || !service.extraFields) return;
+
+  service.extraFields.forEach((field) => {
+    const group = document.createElement('div');
+    group.className = 'form-group';
+
+    const label = document.createElement('label');
+    label.textContent = field.label + (field.required ? ' *' : '');
+    group.appendChild(label);
+
+    let input;
+    if (field.type === 'service-select') {
+      input = document.createElement('select');
+      input.className = 'form-select';
+      const emptyOpt = document.createElement('option');
+      emptyOpt.value = '';
+      emptyOpt.textContent = '-- Not selected --';
+      input.appendChild(emptyOpt);
+
+      SERVICES.individual
+        .filter((s) => s.id !== service.id && s.price != null)
+        .forEach((s) => {
+          const opt = document.createElement('option');
+          opt.value = s.id;
+          opt.textContent = `${s.name} — ${formatNumber(s.price)} DKK`;
+          input.appendChild(opt);
+        });
+    } else {
+      input = document.createElement('input');
+      input.className = 'form-input';
+      input.type = field.type === 'number' ? 'number' : 'text';
+      if (field.type === 'number') input.min = field.min || 1;
+    }
+
+    input.dataset.fieldKey = field.key;
+    input.required = !!field.required;
+    input.addEventListener('input', () => {
+      recomputeIndividualPrice();
+      updateIndividualPayButtonState();
+    });
+    input.addEventListener('change', () => {
+      recomputeIndividualPrice();
+      updateIndividualPayButtonState();
+    });
+
+    group.appendChild(input);
+    container.appendChild(group);
+  });
+}
+
+function getIndividualExtraValues() {
+  const container = $('individual-extra-fields');
+  const values = {};
+  container.querySelectorAll('[data-field-key]').forEach((el) => {
+    values[el.dataset.fieldKey] = el.value;
+  });
+  return values;
+}
+
+function recomputeIndividualPrice() {
+  const service = state.individual.service;
+  let price = 0;
+
+  if (service) {
+    if (service.specialFlow === 'giftcert') {
+      const extra = getIndividualExtraValues();
+      const target = SERVICES.individual.find((s) => s.id === extra.giftForServiceId);
+      price = target ? target.price : 0;
+    } else if (service.perUnit) {
+      const extra = getIndividualExtraValues();
+      const qty = parseInt(extra.photoCount, 10);
+      price = qty > 0 ? service.price * qty : 0;
+    } else {
+      price = service.price;
+    }
+  }
+
+  state.individual.price = price;
+  $('individual-price-display').textContent = `Current Price: ${formatNumber(price)} DKK`;
+}
+
+function updateIndividualPayButtonState() {
+  const btn = $('individual-pay-button');
+  const service = state.individual.service;
+  if (!service || state.individual.price <= 0) {
+    btn.disabled = true;
+    return;
+  }
+  const needsCalendar = service.blockAfterHours !== null;
+  if (needsCalendar && (!state.individual.date || !state.individual.time)) {
+    btn.disabled = true;
+    return;
+  }
+  btn.disabled = false;
+}
+
+function getIndividualContact() {
+  const form = $('individual-form');
+  const gift = $('gift-certificate').checked;
+  let comment = form.comment.value.trim();
+  if (gift) comment = `[GIFT PURCHASE] ${comment}`.trim();
+
+  return {
+    name: form.name.value.trim(),
+    email: form.email.value.trim(),
+    phone: form.phone.value.trim(),
+    location: form.location.value.trim(),
+    comment,
+  };
+}
+
+async function onIndividualPayClick() {
+  const formError = $('individual-form-error');
+  formError.classList.add('hidden');
+
+  const service = state.individual.service;
+  if (!service) return;
+
+  const needsCalendar = service.blockAfterHours !== null;
+  if (needsCalendar && (!state.individual.date || !state.individual.time)) {
+    formError.textContent = 'Please select a date and time.';
+    formError.classList.remove('hidden');
+    return;
+  }
+
+  const contact = getIndividualContact();
+  if (!contact.name || !contact.email || !contact.phone) {
+    formError.textContent = 'Please fill in your name, email and phone.';
+    formError.classList.remove('hidden');
+    return;
+  }
+  if (service.locationField !== 'none' && !contact.location) {
+    formError.textContent = service.locationField === 'googlemeet'
+      ? 'Please enter your Google Meet contact.'
+      : 'Please enter the shoot location.';
+    formError.classList.remove('hidden');
+    return;
+  }
+
+  const extra = getIndividualExtraValues();
+  if (service.extraFields) {
+    for (const f of service.extraFields) {
+      if (f.required && !extra[f.key]) {
+        formError.textContent = `Please fill in: ${f.label}`;
+        formError.classList.remove('hidden');
+        return;
+      }
+    }
+  }
+
+  const payBtn = $('individual-pay-button');
+  payBtn.disabled = true;
+  payBtn.textContent = 'Preparing payment...';
+
   try {
-    await mail.resendConfirmation(booking);
-    res.json({ ok: true });
+    const res = await fetch(`${API_BASE}/api/create-payment-intent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        serviceId: service.id,
+        date: needsCalendar ? state.individual.date : null,
+        time: needsCalendar ? state.individual.time : null,
+        customer: contact,
+        extra,
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.message || 'This time slot is no longer available. Please pick another.');
+    }
+
+    const { clientSecret, paymentIntentId } = await res.json();
+    currentPaymentIntentId = paymentIntentId;
+
+    $('total-price').textContent = `Total: ${formatNumber(state.individual.price)} DKK`;
+    openModal();
+    await initStripePayment(clientSecret);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Could not resend the email.' });
+    formError.textContent = err.message;
+    formError.classList.remove('hidden');
+  } finally {
+    payBtn.disabled = false;
+    payBtn.textContent = 'Pay and Book';
   }
-});
+}
 
-// Manually create a booking from the admin panel (no payment, immediately confirmed)
-app.post('/api/admin/bookings', adminAuth.requireAdmin, (req, res) => {
-  const { category, serviceId, date, time, customer, price, notes } = req.body;
-  const service = cfg.findService(category, serviceId);
-  if (!service) return res.status(400).json({ message: 'Unknown service.' });
+// ============================================================
+// BUSINESS (B2B) PANEL
+// ============================================================
+function setupBusinessPanel() {
+  setupCalendar('biz', 'business');
 
-  let blockedTimes = [];
-  if (date && time && service.blockAfterHours !== null) {
-    const hour = parseInt(time.split(':')[0], 10);
-    blockedTimes = cfg.computeBlockedSlots(hour, service.blockAfterHours);
-    const anyTaken = blockedTimes.some(t => !store.isSlotFree(date, t));
-    if (anyTaken) return res.status(409).json({ message: 'That slot overlaps an existing booking.' });
+  const select = $('business-select');
+  select.addEventListener('change', () => {
+    const service = SERVICES.business.find((s) => s.id === select.value) || null;
+    state.business.serviceId = select.value;
+    state.business.service = service;
+    state.business.price = service ? service.price : 0;
+    state.business.date = null;
+    state.business.time = null;
+    $('biz-datepicker').value = '';
+    $('biz-selected-time-display').textContent = '';
+
+    toggleCalendarBlock('biz', service);
+    renderBusinessLocationField(service);
+
+    $('business-price-display').textContent = `Service Price: ${formatNumber(state.business.price)} DKK`;
+    updateBusinessButtonState();
+  });
+
+  $('business-submit-button').addEventListener('click', onBusinessSubmitClick);
+}
+
+function renderBusinessLocationField(service) {
+  const group = $('business-location-group');
+  const input = group.querySelector('input[name="location"]');
+  if (!service || service.locationField === 'none') {
+    group.classList.add('hidden');
+    input.required = false;
+  } else {
+    group.classList.remove('hidden');
+    input.required = true;
   }
+}
 
-  const booking = {
-    id: crypto.randomUUID(),
-    source: 'admin',
-    status: 'confirmed',
-    category,
-    serviceId: service.id,
-    serviceName: service.name,
-    price: price || service.price,
-    blockAfterHoursRule: service.blockAfterHours,
-    date: date || null,
-    time: time || null,
-    blockedTimes,
-    locationFieldType: service.locationField,
-    customer: customer || {},
-    adminNote: notes || '',
-    createdAt: new Date().toISOString(),
+function updateBusinessButtonState() {
+  const btn = $('business-submit-button');
+  const service = state.business.service;
+  if (!service) {
+    btn.disabled = true;
+    return;
+  }
+  const needsCalendar = service.blockAfterHours !== null;
+  if (needsCalendar && (!state.business.date || !state.business.time)) {
+    btn.disabled = true;
+    return;
+  }
+  btn.disabled = false;
+}
+
+async function onBusinessSubmitClick() {
+  const formError = $('business-form-error');
+  const formSuccess = $('business-form-success');
+  formError.classList.add('hidden');
+  formSuccess.classList.add('hidden');
+
+  const service = state.business.service;
+  if (!service) return;
+
+  const form = $('business-form');
+  const customer = {
+    companyName: form.companyName.value.trim(),
+    cvr: form.cvr.value.trim(),
+    legalAddress: form.legalAddress.value.trim(),
+    invoiceEmail: form.invoiceEmail.value.trim(),
+    contactName: form.contactName.value.trim(),
+    location: form.location.value.trim(),
   };
 
-  store.addBooking(booking);
-  res.json({ ok: true, booking });
-});
+  if (!customer.companyName || !customer.cvr || !customer.legalAddress || !customer.invoiceEmail || !customer.contactName) {
+    formError.textContent = 'Please fill in all required company details.';
+    formError.classList.remove('hidden');
+    return;
+  }
+  if (service.locationField !== 'none' && !customer.location) {
+    formError.textContent = 'Please enter the shoot location.';
+    formError.classList.remove('hidden');
+    return;
+  }
 
-app.listen(PORT, () => {
-  console.log(`Booking backend running on port ${PORT}`);
+  const needsCalendar = service.blockAfterHours !== null;
+  if (needsCalendar && (!state.business.date || !state.business.time)) {
+    formError.textContent = 'Please select a date and time.';
+    formError.classList.remove('hidden');
+    return;
+  }
+
+  const btn = $('business-submit-button');
+  btn.disabled = true;
+  btn.textContent = 'Submitting...';
+
+  try {
+    const res = await fetch(`${API_BASE}/api/business-booking`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        serviceId: service.id,
+        date: needsCalendar ? state.business.date : null,
+        time: needsCalendar ? state.business.time : null,
+        customer,
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.message || 'Could not submit the request. Please try again.');
+    }
+
+    formSuccess.textContent = 'Your booking request was submitted! A deposit invoice has been sent to your email — please pay it within 24 hours to secure the slot.';
+    formSuccess.classList.remove('hidden');
+    form.reset();
+    state.business.service = null;
+    state.business.date = null;
+    state.business.time = null;
+    $('business-select').value = '';
+    $('biz-datepicker').value = '';
+    $('biz-selected-time-display').textContent = '';
+    $('business-calendar-block').classList.add('hidden');
+    $('business-price-display').textContent = 'Service Price: 0 DKK';
+  } catch (err) {
+    formError.textContent = err.message;
+    formError.classList.remove('hidden');
+  } finally {
+    btn.textContent = 'Request Invoice & Book';
+    updateBusinessButtonState();
+  }
+}
+
+// ============================================================
+// COLLAPSIBLE B2B POLICY
+// ============================================================
+function setupPolicyToggle() {
+  const toggle = $('policy-toggle');
+  const content = $('policy-content');
+  if (!toggle || !content) return;
+  toggle.addEventListener('click', () => {
+    content.classList.toggle('hidden');
+  });
+}
+
+// ============================================================
+// STRIPE MODAL (individual bookings only)
+// ============================================================
+function openModal() {
+  $('payment-modal')?.classList.remove('hidden');
+}
+function closeModal() {
+  $('payment-modal')?.classList.add('hidden');
+}
+
+let elements;
+let cardElement;
+
+async function initStripePayment(clientSecret) {
+  elements = stripe.elements();
+  if (cardElement) cardElement.unmount();
+  cardElement = elements.create('card');
+  cardElement.mount('#card-element');
+
+  const form = $('payment-form');
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = $('submit-stripe');
+    btn.disabled = true;
+    btn.textContent = 'Processing...';
+
+    const { error, paymentIntent } = await stripe.confirmCardPayment(clientSecret, {
+      payment_method: { card: cardElement },
+    });
+
+    if (error) {
+      const err = $('card-errors');
+      err.textContent = error.message;
+      err.classList.remove('hidden');
+      btn.disabled = false;
+      btn.textContent = 'Pay Now';
+      return;
+    }
+
+    if (paymentIntent && paymentIntent.status === 'succeeded') {
+      try {
+        await fetch(`${API_BASE}/api/finalize-booking`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paymentIntentId: currentPaymentIntentId }),
+        });
+      } catch (err) {
+        console.error('Finalize call failed (webhook will still confirm it):', err);
+      }
+
+      alert('✅ Payment successful! A confirmation email is on its way to you.');
+      location.reload();
+    }
+  };
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  const closeBtn = $('close-modal');
+  if (closeBtn) closeBtn.onclick = closeModal;
+
+  const modal = $('payment-modal');
+  if (modal) modal.addEventListener('click', closeModal);
+
+  initStaticUI();
+  loadServices();
 });
