@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+    <meta charset="UTF-8">
+    <title>Invoice</title>
+    <style>
+        body {
+            font-family: 'Josefin Sans', Arial, sans-serif;
+            color: #333;
+            line-height: 1.4;
+            margin: 0;
+            padding: 40px;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 40px;
+        }
+        .logo {
+            font-size: 24px;
+            font-weight: bold;
+            color: #111;
+        }
+        .invoice-title {
+            font-size: 28px;
+            text-transform: uppercase;
+            color: #555;
+            text-align: right;
+        }
+        .details-container {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 40px;
+        }
+        .company-details, .client-details {
+            width: 45%;
+        }
+        .section-title {
+            font-size: 12px;
+            text-transform: uppercase;
+            color: #888;
+            margin-bottom: 5px;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 3px;
+        }
+        .meta-table {
+            width: 100%;
+            margin-bottom: 30px;
+            border-collapse: collapse;
+        }
+        .meta-table th, .meta-table td {
+            text-align: left;
+            padding: 8px 0;
+            border-bottom: 1px solid #eee;
+            font-size: 14px;
+        }
+        .invoice-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 30px;
+        }
+        .invoice-table th {
+            background-color: #f9f9f9;
+            text-align: left;
+            padding: 10px;
+            font-size: 12px;
+            text-transform: uppercase;
+            color: #666;
+        }
+        .invoice-table td {
+            padding: 12px 10px;
+            border-bottom: 1px solid #eee;
+            font-size: 14px;
+        }
+        .totals {
+            float: right;
+            width: 40%;
+            margin-bottom: 20px;
+        }
+        .totals-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .totals-table td {
+            padding: 6px 0;
+            font-size: 14px;
+        }
+        .totals-table .grand-total {
+            font-size: 18px;
+            font-weight: bold;
+            border-top: 2px solid #333;
+            padding-top: 10px;
+        }
+        .deposit-note {
+            clear: both;
+            background-color: #fff7ed;
+            border: 1px solid #fed7aa;
+            padding: 16px 20px;
+            border-radius: 4px;
+            font-size: 13px;
+            margin-bottom: 30px;
+        }
+        .payment-info {
+            background-color: #f9f9f9;
+            padding: 20px;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        .payment-info h3 {
+            margin-top: 0;
+            font-size: 14px;
+            color: #111;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Шапка -->
+    <div class="header">
+        <div class="logo">[Твой Логотип / Название]</div>
+        <div class="invoice-title">Faktura</div>
+    </div>
+
+    <!-- Реквизиты сторон -->
+    <div class="details-container">
+        <div class="company-details">
+            <div class="section-title">Udsteder (Продавец)</div>
+            <strong>[Название твоего ФОП]</strong><br>
+            [Твой адрес в Дании / Стране]<br>
+            [Индекс и Город]<br>
+            CVR-nr: [Твой CVR или налоговый ID]<br>
+            Email: [Твой Email]
+        </div>
+        <div class="client-details">
+            <div class="section-title">Modtager (Клиент)</div>
+            <strong>{{client_company_name}}</strong><br>
+            {{client_address}}<br>
+            CVR / VAT-nr: {{client_cvr}}<br>
+            Att: {{client_contact_name}}
+        </div>
+    </div>
+
+    <!-- Мета-данные счета -->
+    <table class="meta-table">
+        <thead>
+            <tr>
+                <th>Fakturanummer (№)</th>
+                <th>Dato (Дата)</th>
+                <th>Forfaldsdato (Срок оплаты)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>{{invoice_number}}</td>
+                <td>{{invoice_date}}</td>
+                <td><strong>{{due_date}}</strong></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- Таблица услуг -->
+    <table class="invoice-table">
+        <thead>
+            <tr>
+                <th>Beskrivelse (Описание услуги)</th>
+                <th style="text-align: right;">Antal (Кол-во)</th>
+                <th style="text-align: right;">Pris (Цена)</th>
+                <th style="text-align: right;">Beløb (Сумма)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>{{service_description}}<br><small style="color: #666;">Reservation: {{booking_date_time}}</small></td>
+                <td style="text-align: right;">1</td>
+                <td style="text-align: right;">{{price}} DKK</td>
+                <td style="text-align: right;">{{price}} DKK</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- Итоги -->
+    <div class="totals">
+        <table class="totals-table">
+            <tr>
+                <td>Subtotal (Чистая сумма):</td>
+                <td style="text-align: right;">{{subtotal}} DKK</td>
+            </tr>
+            <tr>
+                <td>Moms (НДС 25%):</td>
+                <td style="text-align: right;">{{moms_amount}} DKK</td>
+            </tr>
+            <tr class="grand-total">
+                <td>Total DKK (Итого к оплате сейчас):</td>
+                <td style="text-align: right;">{{total_amount}} DKK</td>
+            </tr>
+        </table>
+    </div>
+
+    <!-- Пояснение по депозиту -->
+    <div class="deposit-note">
+        This invoice covers a <strong>{{deposit_percent}}% non-refundable deposit</strong> for
+        <strong>{{service_description}}</strong> (full service value: {{full_service_price}} DKK).
+        The remaining balance of {{remaining_balance}} DKK is due before or on the day of the
+        service, as outlined in our Booking &amp; Cancellation Policy.
+    </div>
+
+    <!-- Инструкция по оплате -->
+    <div class="payment-info">
+        <h3>Betalingsoplysninger (Реквизиты для оплаты)</h3>
+        <p>Venligst overfør beløbet til vores bankkonto senest den <strong>{{due_date}}</strong>.</p>
+        <p>
+            <strong>Bank:</strong> [Название банка, например, Danske Bank]<br>
+            <strong>Reg. nr. (Рег. номер):</strong> [XXXX]<br>
+            <strong>Kontonummer (Номер счета):</strong> [XXXXXXXXX]<br>
+            <strong>IBAN:</strong> [DKXX XXXX XXXX XXXX XX]<br>
+            <strong>Reference:</strong> Angiv venligst fakturanr. {{invoice_number}} ved betaling.
+        </p>
+    </div>
+
+</body>
+</html>
