@@ -79,32 +79,20 @@ app.get('/api/availability', (req, res) => {
 // ============================================================
 app.post('/api/create-payment-intent', async (req, res) => {
   try {
-    const { serviceId, date, time, customer, extra } = req.body;
+    const { serviceId, date, time, customer, extra, isGift, recipientName } = req.body;
     const service = cfg.findService('individual', serviceId);
     if (!service) return res.status(400).json({ message: 'Unknown service.' });
     if (!customer || !customer.name || !customer.email || !customer.phone) {
       return res.status(400).json({ message: 'Missing contact details.' });
     }
+    if (isGift && !recipientName) {
+      return res.status(400).json({ message: 'Please enter the recipient\'s full name.' });
+    }
 
     let price = service.price;
     let quantity = null;
-    let giftForServiceId = null;
-    let giftForServiceName = null;
-    let recipientName = null;
 
-    if (service.specialFlow === 'giftcert') {
-      const target = cfg.findService('individual', extra && extra.giftForServiceId);
-      if (!target || target.price == null) {
-        return res.status(400).json({ message: 'Please choose a valid service for the gift certificate.' });
-      }
-      if (!extra || !extra.recipientName) {
-        return res.status(400).json({ message: 'Please enter the recipient\'s full name.' });
-      }
-      price = target.price;
-      giftForServiceId = target.id;
-      giftForServiceName = target.name;
-      recipientName = extra.recipientName;
-    } else if (service.perUnit) {
+    if (service.perUnit) {
       quantity = parseInt(extra && extra.photoCount, 10);
       if (!quantity || quantity < 1) {
         return res.status(400).json({ message: 'Please enter a valid number of photos.' });
@@ -140,9 +128,8 @@ app.post('/api/create-payment-intent', async (req, res) => {
         price: String(price),
         quantity: quantity ? String(quantity) : '',
         specialFlow: service.specialFlow || '',
-        giftForServiceId: giftForServiceId || '',
-        giftForServiceName: giftForServiceName || '',
-        recipientName: recipientName || '',
+        isGift: isGift ? 'true' : '',
+        recipientName: isGift ? recipientName : '',
         date: needsCalendar ? date : '',
         time: needsCalendar ? time : '',
         blockedTimes: JSON.stringify(blockedTimes),
@@ -186,7 +173,7 @@ async function finalizeIndividualBooking(paymentIntentObjOrId) {
     price: parseInt(m.price, 10),
     quantity: m.quantity ? parseInt(m.quantity, 10) : null,
     specialFlow: m.specialFlow || null,
-    giftForServiceName: m.giftForServiceName || null,
+    isGift: m.isGift === 'true',
     recipientName: m.recipientName || null,
     date: m.date || null,
     time: m.time || null,
@@ -366,7 +353,7 @@ app.post('/api/admin/bookings/:id/resend', adminAuth.requireAdmin, async (req, r
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: 'Could not resend the email.' });
+    res.status(500).json({ message: `Could not resend the email: ${err.message}` });
   }
 });
 
