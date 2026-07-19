@@ -43,15 +43,6 @@ const INDIVIDUAL_SERVICES = [
   { id: 'workshop', name: 'Camera Photo Workshop', price: 2500, blockAfterHours: 3, locationField: 'address', specialFlow: null },
 
   {
-    id: 'giftcert', name: 'Gift Certificate', price: null, blockAfterHours: null, locationField: 'none',
-    specialFlow: 'giftcert',
-    extraFields: [
-      { key: 'giftForServiceId', label: 'Which service is this a gift for?', type: 'service-select', required: true },
-      { key: 'recipientName', label: 'Full name of the recipient', type: 'text', required: true },
-    ],
-  },
-
-  {
     id: 'review', name: 'Portfolio Review', price: 1200, blockAfterHours: 2, locationField: 'googlemeet', specialFlow: null,
   },
 ];
