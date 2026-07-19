@@ -203,7 +203,11 @@ async function finalizeIndividualBooking(paymentIntentObjOrId) {
   };
 
   store.addBooking(booking);
-  await mail.sendIndividualBookingEmails(booking);
+  try {
+    await mail.sendIndividualBookingEmails(booking);
+  } catch (mailErr) {
+    console.error('Booking saved, but sending the confirmation email failed:', mailErr);
+  }
   return booking;
 }
 
@@ -274,7 +278,11 @@ app.post('/api/business-booking', async (req, res) => {
     };
 
     store.addBooking(booking);
-    await mail.sendBusinessBookingEmails(booking);
+    try {
+      await mail.sendBusinessBookingEmails(booking);
+    } catch (mailErr) {
+      console.error('B2B booking saved, but sending the invoice email failed:', mailErr);
+    }
 
     res.json({ ok: true, bookingId: booking.id });
   } catch (err) {
