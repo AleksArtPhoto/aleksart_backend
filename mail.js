@@ -26,6 +26,25 @@ function send(to, subject, text, html) {
 async function sendIndividualBookingEmails(booking) {
   const c = booking.customer;
 
+  if (booking.isGift) {
+    const whenLine = booking.date ? `\nScheduled for: ${booking.date} ${booking.time}` : '';
+    const text = `Dear ${c.name},
+
+Thank you for your purchase! You've gifted "${booking.serviceName}" to ${booking.recipientName}.
+${whenLine}
+Amount paid: ${booking.price} DKK
+
+You will receive the gift certificate itself by email shortly, ready to pass on to ${booking.recipientName}.
+
+Best regards,
+Aleks Art Photo`;
+
+    await send(c.email, 'Gift Certificate Purchase Confirmed | Aleks Art Photo', text);
+    await send(process.env.OWNER_EMAIL, `New gift purchase — ${c.name} → ${booking.recipientName}`,
+      `Gift certificate purchased.\n\nService: ${booking.serviceName}${whenLine}\nRecipient name: ${booking.recipientName}\nAmount paid: ${booking.price} DKK\n\nBuyer: ${c.name}\nEmail: ${c.email}\nPhone: ${c.phone}`);
+    return;
+  }
+
   if (booking.specialFlow === 'materials') {
     // Pro Edit / Fine Art Retouch / Photo Restoration — no calendar slot
     const qtyLine = booking.quantity ? `Quantity: ${booking.quantity} photo(s)\n` : '';
@@ -45,24 +64,6 @@ Aleks Art Photo`;
     await send(c.email, 'Payment Confirmed — Please Send Your Materials | Aleks Art Photo', text);
     await send(process.env.OWNER_EMAIL, `New paid order (materials): ${booking.serviceName} — ${c.name}`,
       `${text}\n\n--- Customer contact ---\nEmail: ${c.email}\nPhone: ${c.phone}`);
-    return;
-  }
-
-  if (booking.specialFlow === 'giftcert') {
-    const text = `Dear ${c.name},
-
-Thank you for your purchase! Your gift certificate for "${booking.giftForServiceName}" (recipient: ${booking.recipientName}) has been confirmed.
-
-Amount paid: ${booking.price} DKK
-
-You will receive the gift certificate itself by email shortly.
-
-Best regards,
-Aleks Art Photo`;
-
-    await send(c.email, 'Gift Certificate Purchase Confirmed | Aleks Art Photo', text);
-    await send(process.env.OWNER_EMAIL, `New gift certificate order — ${c.name}`,
-      `Gift certificate purchased.\n\nFor service: ${booking.giftForServiceName}\nRecipient name: ${booking.recipientName}\nAmount paid: ${booking.price} DKK\n\nBuyer: ${c.name}\nEmail: ${c.email}\nPhone: ${c.phone}`);
     return;
   }
 
